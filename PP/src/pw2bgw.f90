@@ -5493,11 +5493,11 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
         'formatted', iostat = ios)
     
     ! 1 denotes momentum operator
-    WRITE(iunmout) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, 1
-    WRITE(iunmout) pmec(ipol, :, :, :)
+    WRITE(iunmout, *) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, 1
+    WRITE(iunmout, *) pmec(ipol, :, :, :)
     ! <0 denotes velocity operator
-    WRITE(iunvout) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, -1
-    WRITE(iunvout) dmec(ipol, :, :, :)
+    WRITE(iunvout, *) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, -1
+    WRITE(iunvout, *) dmec(ipol, :, :, :)
 
     CLOSE(iunmout)
     CLOSE(iunvout)
