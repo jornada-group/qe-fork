@@ -209,12 +209,12 @@ PROGRAM pw2bgw
     rhog_nvmin, rhog_nvmax, vxcg_flag, vxcg_file, vxc0_flag, vxc0_file, &
     vxc_flag, vxc_file, vxc_integral, vxc_diag_nmin, vxc_diag_nmax, &
     vxc_offdiag_nmin, vxc_offdiag_nmax, vxc_zero_rho_core, &
-    write_vmtxl_flag, &! Mandatory flag for writing dipole matrix elements
-    momentum_output_file_name, velocity_output_file_name, &! Variables for writing dipole matrix elements
-    mbandst, mbandend, nbandst, nbandend, &! Variables for writing dipole matrix elements
+    write_vmtxl_flag, & ! Mandatory flag for writing dipole matrix elements
+    momentum_output_file_name, velocity_output_file_name, & ! Variables for writing dipole matrix elements
+    mbandst,mbandend, nbandst, nbandend, & ! Variables for writing dipole matrix elements
     vscg_flag, vscg_file, vkbg_flag, vkbg_file, kih_flag, & !FZ: for KIH
     kih_file, vxc_hybrid_flag, vxc_hybrid_file, & !FZ: for hybrid functional
-    vhub_flag, vhub_file, vhub_diag_nmin, vhub_diag_nmax, vhub_offdiag_nmin, vhub_offdiag_nmax! MW: for Hubbard potential
+    vhub_flag, vhub_file, vhub_diag_nmin, vhub_diag_nmax, vhub_offdiag_nmin, vhub_offdiag_nmax ! MW: for Hubbard potential
     !kih_diag_nmin, kih_diag_nmax, & !FZ: for KIH 
     !kih_offdiag_nmin, kih_offdiag_nmax, vxc_hybrid_diag_nmin, &  !FZ: for hybrid
     !vxc_hybrid_diag_nmax, vxc_hybrid_offdiag_nmin, vxc_hybrid_offdiag_nmax  !FZ: for hybrid functional
@@ -288,9 +288,12 @@ PROGRAM pw2bgw
   momentum_output_file_name = 'pmtxel'
   velocity_output_file_name = 'vmtxel'
   mbandst = 1
-  mbandend = nbnd
+  mbandend = 0
   nbandst = 1
-  nbandend = nbnd
+  nbandend = 0
+  write_vmtxl_flag = .FALSE.
+
+
 
   IF ( ionode ) THEN
     CALL input_from_file ( )
@@ -381,6 +384,7 @@ PROGRAM pw2bgw
   CALL mp_bcast ( mbandend, ionode_id, world_comm )
   CALL mp_bcast ( nbandst, ionode_id, world_comm )
   CALL mp_bcast ( nbandend, ionode_id, world_comm )
+  CALL mp_bcast ( write_vmtxl_flag, ionode_id, world_comm )
   CALL read_file ( )
 
   !CALL setup ()
@@ -477,6 +481,8 @@ PROGRAM pw2bgw
     'Sigma using VXC.', 7)
 
   CALL openfil_pp ( )
+
+
 
   ! MW: Atomic configuration dependent hamiltonian initialization
   IF ( lda_plus_u ) THEN
@@ -631,6 +637,13 @@ PROGRAM pw2bgw
   ENDIF
 
   IF (write_vmtxl_flag) THEN
+    
+    IF (mbandend == 0) THEN
+      mbandend = nbnd
+    ENDIF
+    IF (nbandend == 0) THEN
+      nbandend = nbnd
+    ENDIF
     IF ( ionode ) WRITE ( 6, '(5x,"call write_vmtxl")' )
     CALL start_clock ( 'write_vmtxl' )
     CALL write_vmtxl(momentum_output_file_name, velocity_output_file_name, mbandst, mbandend, nbandst, nbandend)
@@ -5396,12 +5409,12 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
     CALL errore('write_vmtxl', 'Not implemented for ultrasoft pseudos', 1)
   ENDIF
 
-  ALLOCATE(dmec(3, nbnd, nbnd, nks), STAT = ierr)
+  ALLOCATE(dmec(3, nbandend - nbandst + 1, mbandend - mbandst + 1, nks), STAT = ierr)
   IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating dmec', 1)
   dmec = czero
 
 
-  ALLOCATE(pmec(3, nbnd, nbnd, nks), STAT = ierr)
+  ALLOCATE(pmec(3, nbandend - nbandst + 1, mbandend - mbandst + 1, nks), STAT = ierr)
   IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating mec', 1)
   pmec = czero
 
@@ -5485,19 +5498,20 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
   
     iunmout=58
     fname = trim(momentum_output_file_name) // '_' // suffix(ipol)
-    OPEN(unit = iunmout, file = trim(momentum_output_file_name), status = 'replace', form = &
+    OPEN(unit = iunmout, file = fname, status = 'replace', form = &
         'formatted', iostat = ios)
     iunvout=59
     fname = trim(velocity_output_file_name) // '_' // suffix(ipol)
-    OPEN(unit = iunvout, file = trim(velocity_output_file_name), status = 'replace', form = &
+    OPEN(unit = iunvout, file = fname, status = 'replace', form = &
         'formatted', iostat = ios)
     
-    ! 1 denotes momentum operator
-    WRITE(iunmout, *) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, 1
-    WRITE(iunmout, *) pmec(ipol, :, :, :)
-    ! <0 denotes velocity operator
-    WRITE(iunvout, *) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, -1
-    WRITE(iunvout, *) dmec(ipol, :, :, :)
+    ! Write momentum operator matrix elements
+    WRITE(iunmout, '(5I8)') nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, 1
+    WRITE(iunmout, '(2ES24.15E3)') pmec(ipol, :, :, :)
+    
+    ! Write velocity operator matrix elements
+    WRITE(iunvout, '(5I8)') nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, -1
+    WRITE(iunvout, '(2ES24.15E3)') dmec(ipol, :, :, :)
 
     CLOSE(iunmout)
     CLOSE(iunvout)
