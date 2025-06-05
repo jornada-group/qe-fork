@@ -129,6 +129,7 @@ PROGRAM pw2bgw
   USE paw_variables, ONLY : okpaw
   USE scf, ONLY : rho_core, rhog_core
   USE uspp, ONLY : okvan
+  USE wvfct,ONLY : nbnd ! For default values of mbandst, mbandend, nbandst, nbandend required for writing dipole matrix elements
   !USE funct, ONLY : dft_is_hybrid, dft_is_meta, dft_is_gradient !FZ: for hybrid functional, metaGGA, add dft_is_gradient for spinors
   USE xc_lib, ONLY : xclib_dft_is  !FZ: for qe6.7, for hybrid functional, metaGGA, add dft_is_gradient for spinors
   USE ldaU, ONLY : lda_plus_u
@@ -193,6 +194,14 @@ PROGRAM pw2bgw
   character ( len = 256 ) :: vhub_file
   integer :: vhub_diag_nmin, vhub_diag_nmax, vhub_offdiag_nmin, vhub_offdiag_nmax
 
+  logical :: write_vmtxl_flag
+  character ( len = 256 ) :: momentum_output_file_name
+  character ( len = 256 ) :: velocity_output_file_name
+  integer :: mbandst
+  integer :: mbandend
+  integer :: nbandst
+  integer :: nbandend
+
   NAMELIST / input_pw2bgw / prefix, outdir, &
     real_or_complex, symm_type, wfng_flag, wfng_file, wfng_kgrid, &
     wfng_nk1, wfng_nk2, wfng_nk3, wfng_dk1, wfng_dk2, wfng_dk3, &
@@ -200,9 +209,12 @@ PROGRAM pw2bgw
     rhog_nvmin, rhog_nvmax, vxcg_flag, vxcg_file, vxc0_flag, vxc0_file, &
     vxc_flag, vxc_file, vxc_integral, vxc_diag_nmin, vxc_diag_nmax, &
     vxc_offdiag_nmin, vxc_offdiag_nmax, vxc_zero_rho_core, &
+    write_vmtxl_flag, &! Mandatory flag for writing dipole matrix elements
+    momentum_output_file_name, velocity_output_file_name, &! Variables for writing dipole matrix elements
+    mbandst, mbandend, nbandst, nbandend, &! Variables for writing dipole matrix elements
     vscg_flag, vscg_file, vkbg_flag, vkbg_file, kih_flag, & !FZ: for KIH
     kih_file, vxc_hybrid_flag, vxc_hybrid_file, & !FZ: for hybrid functional
-    vhub_flag, vhub_file, vhub_diag_nmin, vhub_diag_nmax, vhub_offdiag_nmin, vhub_offdiag_nmax ! MW: for Hubbard potential
+    vhub_flag, vhub_file, vhub_diag_nmin, vhub_diag_nmax, vhub_offdiag_nmin, vhub_offdiag_nmax! MW: for Hubbard potential
     !kih_diag_nmin, kih_diag_nmax, & !FZ: for KIH 
     !kih_offdiag_nmin, kih_offdiag_nmax, vxc_hybrid_diag_nmin, &  !FZ: for hybrid
     !vxc_hybrid_diag_nmax, vxc_hybrid_offdiag_nmin, vxc_hybrid_offdiag_nmax  !FZ: for hybrid functional
@@ -267,10 +279,18 @@ PROGRAM pw2bgw
   vkbg_file = 'VKB'
   vhub_flag = .false.  
   vhub_file = 'vhub.dat'
+
   vhub_diag_nmin = 0
   vhub_diag_nmax = 0
   vhub_offdiag_nmin = 0
   vhub_offdiag_nmax = 0
+
+  momentum_output_file_name = 'pmtxel'
+  velocity_output_file_name = 'vmtxel'
+  mbandst = 1
+  mbandend = nbnd
+  nbandst = 1
+  nbandend = nbnd
 
   IF ( ionode ) THEN
     CALL input_from_file ( )
@@ -355,6 +375,12 @@ PROGRAM pw2bgw
   CALL mp_bcast ( vhub_diag_nmax, ionode_id, world_comm )
   CALL mp_bcast ( vhub_offdiag_nmin, ionode_id, world_comm )
   CALL mp_bcast ( vhub_offdiag_nmax, ionode_id, world_comm )
+  CALL mp_bcast ( momentum_output_file_name, ionode_id, world_comm )
+  CALL mp_bcast ( velocity_output_file_name, ionode_id, world_comm )
+  CALL mp_bcast ( mbandst, ionode_id, world_comm )
+  CALL mp_bcast ( mbandend, ionode_id, world_comm )
+  CALL mp_bcast ( nbandst, ionode_id, world_comm )
+  CALL mp_bcast ( nbandend, ionode_id, world_comm )
   CALL read_file ( )
 
   !CALL setup ()
@@ -603,6 +629,14 @@ PROGRAM pw2bgw
     CALL stop_clock ( 'write_vhub' )
     IF ( ionode ) WRITE ( 6, '(5x,"done write_vhub",/)' )
   ENDIF
+
+  IF (write_vmtxl_flag) THEN
+    IF ( ionode ) WRITE ( 6, '(5x,"call write_vmtxl")' )
+    CALL start_clock ( 'write_vmtxl' )
+    CALL write_vmtxl(momentum_output_file_name, velocity_output_file_name, mbandst, mbandend, nbandst, nbandend)
+    CALL stop_clock ( 'write_vmtxl' )
+    IF ( ionode ) WRITE ( 6, '(5x,"done write_vmtxl",/)' )
+  ENDIF
   
   IF ( ionode ) WRITE ( 6, * )
   IF ( wfng_flag ) CALL print_clock ( 'write_wfng' )
@@ -615,6 +649,7 @@ PROGRAM pw2bgw
   ENDIF
   IF ( vscg_flag ) CALL print_clock ( 'write_vscg' )
   IF ( vkbg_flag ) CALL print_clock ( 'write_vkbg' )
+  IF ( write_vmtxl_flag ) CALL print_clock ( 'write_vmtxl' )
   IF ( wfng_flag .AND. real_or_complex .EQ. 1 ) THEN
     IF ( ionode ) WRITE ( 6, '(/,5x,"Called by write_wfng:")' )
     CALL print_clock ( 'real_wfng' )
@@ -5309,7 +5344,7 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
   !! Counter on k-points
   INTEGER :: ierr
   !! Error status
-  INTEGER :: iunpout
+  INTEGER :: iunmout
   !! Unit for output file for momentum matrix elements
   INTEGER :: iunvout
   !! Unit for output file for velocity matrix elements
@@ -5404,17 +5439,17 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
       DO ibnd=mbandst, mbandend
         DO jbnd=nbandst, nbandend
         ! Computing <psi|i[H, r]|psi>
-          dmec(:, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, dpsi(1, ibnd), 1)
+          dmec(ipol, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, dpsi(1, ibnd), 1)
           ! Computing <psi|\hat{p}|psi>
           IF (noncolin) THEN
-            dmec(ipol, jbnd, ibnd, ik) = dmec(ipol, jbnd, ibnd) + &
-            ZDOTC(npw, evc(1+npwx, lbnd), 1, dpsi(1+npwx, ibnd), 1)
+            dmec(ipol, jbnd, ibnd, ik) = dmec(ipol, jbnd, ibnd, ik) + &
+            ZDOTC(npw, evc(1+npwx, jbnd), 1, dpsi(1+npwx, ibnd), 1)
           ENDIF
           ! 
-          pmec(:, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, ppsi(1, ibnd), 1) 
+          pmec(ipol, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, ppsi(1, ibnd), 1) 
           IF (noncolin) THEN
-            pmec(ipol, jbnd, ibnd, ik) = pmec(ipol, jbnd, ibnd) + &
-            ZDOTC(npw, evc(1+npwx, lbnd), 1, ppsi(1+npwx, ibnd), 1)
+            pmec(ipol, jbnd, ibnd, ik) = pmec(ipol, jbnd, ibnd, ik) + &
+            ZDOTC(npw, evc(1+npwx, jbnd), 1, ppsi(1+npwx, ibnd), 1)
           ENDIF
         ENDDO ! jbnd
       ENDDO ! ibnd
@@ -5481,6 +5516,72 @@ subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mba
 
 
 END SUBROUTINE write_vmtxl
+
+!-----------------------------------------------------------------------
+SUBROUTINE multiply_momentum_psi(ik, nbnd_calc, vpol, ppsi)
+!----------------------------------------------------------------------
+  ! Taken from EPW/src/pw2wan.f90 multiply_momentum_psi subroutine
+  ! On output: ppsi contains -2i p | psi_ik >
+  !
+  ! vpol is the polarization vector in Cartesian coordinates.
+  ! For crystal coordinate, use vpol = at(:, ipol).
+  ! For Cartesian coordinate, use vpol = (1.0, 0.0, 0.0) or other permutations.
+  !
+  ! Based on PW/src/commutator_Hx_psi.f90
+  !
+  USE kinds,           ONLY : DP
+  USE cell_base,       ONLY : tpiba
+  USE klist,           ONLY : xk, igk_k, ngk
+  USE gvect,           ONLY : g
+  USE wvfct,           ONLY : npwx
+  USE wavefunctions,   ONLY : evc
+  USE noncollin_module,ONLY : noncolin, npol
+  !
+  IMPLICIT NONE
+  !
+  COMPLEX(DP), INTENT(OUT) :: ppsi(npwx*npol, nbnd_calc)
+  !
+  INTEGER, INTENT(IN) :: ik, nbnd_calc
+  REAL(DP), INTENT(IN) :: vpol(3)
+  !! polarization vector in Cartesian coordinates
+  !
+  ! Local variables
+  !
+  INTEGER :: npw, ig, ibnd
+  ! counters
+  REAL(KIND = DP) :: gk_ig(3)
+  REAL(KIND = DP), ALLOCATABLE :: g2k(:), gk_vpol(:)
+  ! the derivative of |k+G|
+  !
+  ppsi = (0.d0, 0.d0)
+  !
+  npw = ngk(ik)
+  ALLOCATE(gk_vpol(npw), g2k(npw) )
+  !
+  DO ig = 1, npw
+    gk_ig(1:3) = (xk (1:3, ik) + g (1:3, igk_k(ig,ik) ) ) * tpiba
+    g2k (ig) = SUM(gk_ig**2)
+    !
+    ! Take the component along the vpol vector
+    gk_vpol(ig) = SUM(vpol * gk_ig(:))
+  ENDDO
+  !
+  ! Compute (k+G)_ipol * psi
+  !
+  DO ibnd = 1, nbnd_calc
+    DO ig = 1, npw
+      ppsi(ig, ibnd) = gk_vpol(ig) * evc(ig, ibnd)
+    ENDDO
+    IF (noncolin) THEN
+      DO ig = 1, npw
+        ppsi(ig+npwx, ibnd) = gk_vpol(ig) * evc(ig+npwx, ibnd)
+      ENDDO
+    ENDIF
+  ENDDO
+  !
+END SUBROUTINE multiply_momentum_psi
+!
+
 
 
 
