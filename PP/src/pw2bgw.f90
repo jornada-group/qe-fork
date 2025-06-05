@@ -98,6 +98,8 @@
 !               (units of Rydberg)
 ! check_inversion - checks whether real/complex version is appropriate
 !               (called from everywhere)
+
+! write_vmtxl - Writes the velocity/dipole matrix elements in the formats of BGW
 !
 ! Quantum ESPRESSO stores the wavefunctions in is-ik-ib-ig order
 ! BerkeleyGW stores the wavefunctions in ik-ib-is-ig order
@@ -167,7 +169,7 @@ PROGRAM pw2bgw
   character :: vxc_integral
   logical :: kih_flag                 !FZ: Kinetic energy + Ionic potential + Hartree 
   character ( len = 256 ) :: kih_file !FZ: 
-  logical :: vxc_hybrid_flag                 !FZ: Only used for hybrid functional!
+  logical :: vxc_hybrid_flag                 !FZ: Only used for hybrid functional!3
   character ( len = 256 ) :: vxc_hybrid_file !FZ: Band Energy - (Kinetic energy + Ionic potential + Hartree) 
   integer :: vxc_diag_nmin
   integer :: vxc_diag_nmax
@@ -5250,6 +5252,248 @@ subroutine set_spin(ns, nst, nsf, nspin)
 end subroutine set_spin
 
 !-------------------------------------------------------------------------------
+subroutine write_vmtxl(momentum_output_file_name, velocity_output_file_name, mbandst, mbandend, nbandst, nbandend)
+
+  !!
+  !!  If include_nonlocal == .TRUE. (default):
+  !!  Computes i[H, \vec{r}] (in Rydberg atomic units) with the non-local
+  !!  pseudopotential term and additional terms from USPP or PAW considered.
+  !!  
+  !!  Save the result in dmec, and pmec.
+  !!
+  !!  If include_nonlocal == .FALSE.:
+  !!  Computes matrix elements of momentum operator p.
+  !!  Save the result in pmec.
+  !!
+  !!  Based on PP/src/compute_ppsi.f90
+  !!
+  
+  USE kinds,                ONLY : DP
+  USE wvfct,                ONLY : nbnd, npwx, et
+  USE wavefunctions,        ONLY : evc
+  USE cell_base,            ONLY : at
+  USE noncollin_module,     ONLY : noncolin, npol, lspinorb
+  USE uspp,                 ONLY : vkb, nkb, okvan
+  USE becmod,               ONLY : bec_type, calbec, allocate_bec_type, &
+                                  deallocate_bec_type
+  USE klist,                ONLY : xk, ngk, igk_k, nks
+  USE mp_pools,             ONLY : my_pool_id
+  USE ions_base,            ONLY : ntyp => nsp
+  USE lsda_mod,             ONLY : nspin
+  USE uspp_param,           ONLY : nhm
+  USE io_files,             ONLY : nwordwfc, iunwfc
+  USE io_global,            ONLY : stdout, ionode
+  USE uspp_init,            ONLY : init_us_2
+
+  IMPLICIT NONE
+
+  character (len = 256), intent (in) :: momentum_output_file_name
+  character (len = 256), intent (in) :: velocity_output_file_name
+
+  INTEGER, intent (in) :: mbandst, mbandend, nbandst, nbandend
+
+  TYPE(bec_type) :: becp2, becp3
+  !! the scalar products between wavefunctions and projectors
+  !
+
+  INTEGER :: ibnd
+  !! Counter on bands
+  INTEGER :: jbnd
+  !! Counter on bands
+
+  INTEGER :: ipol
+  !! Counter on polarizations
+  INTEGER :: npw
+  !! Number of plane waves
+  INTEGER :: ik
+  !! Counter on k-points
+  INTEGER :: ierr
+  !! Error status
+  INTEGER :: iunpout
+  !! Unit for output file for momentum matrix elements
+  INTEGER :: iunvout
+  !! Unit for output file for velocity matrix elements
+  !
+  REAL(KIND = DP)                 :: a0(3, 3)
+  !! Cartesian unit vectors
+  !
+  COMPLEX(KIND = DP), EXTERNAL    :: ZDOTC
+  !!
+  COMPLEX(KIND = DP)              :: dipole_aux(3, nbnd, nbnd)
+  !! Auxilary dipole
+  COMPLEX(KIND = DP), ALLOCATABLE :: dpsi(:, :)
+  !! i * [H, r] | psi_nk >
+
+  COMPLEX(KIND = DP), ALLOCATABLE :: ppsi(:, :)
+  !! i * \hat{p} | psi_nk >
+
+
+  COMPLEX(KIND = DP), ALLOCATABLE :: dvpsi(:, :)
+  !! Commutator term due to the augmentation part
+  !
+  COMPLEX(KIND = DP), ALLOCATABLE :: dmec(:, :, :, :)
+  !
+  COMPLEX(KIND = DP), ALLOCATABLE :: pmec(:, :, :, :)
+
+  COMPLEX(KIND = DP), PARAMETER :: ci    = (0.0E0_DP, 1.0E0_DP)
+  COMPLEX(KIND = DP), PARAMETER :: cone  = (1.0E0_DP, 0.0E0_DP)
+  COMPLEX(KIND = DP), PARAMETER :: czero = (0.0E0_DP, 0.0E0_DP)
+  REAL(KIND = DP), PARAMETER :: eps6  = 1.0E-6_DP
+
+  character(len=128) :: fname
+
+  character(len=2) :: suffix(3) = (/'b1', 'b2', 'b3'/)
+
+  IF ( ionode ) THEN
+    !
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+    WRITE(stdout, '(/5x, a)') 'Beginning calculation of dipole matrix elements'
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+    !
+  ENDIF  
+
+  !
+  a0(:, 1) = (/ 1d0, 0d0, 0d0 /)
+  a0(:, 2) = (/ 0d0, 1d0, 0d0 /)
+  a0(:, 3) = (/ 0d0, 0d0, 1d0 /)
+  !
+  IF (okvan) THEN
+    CALL errore('write_vmtxl', 'Not implemented for ultrasoft pseudos', 1)
+  ENDIF
+
+  ALLOCATE(dmec(3, nbnd, nbnd, nks), STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating dmec', 1)
+  dmec = czero
+
+
+  ALLOCATE(pmec(3, nbnd, nbnd, nks), STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating mec', 1)
+  pmec = czero
+
+  ALLOCATE(dpsi(npwx * npol, nbnd), STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating dpsi', 1)
+
+
+  ALLOCATE(ppsi(npwx * npol, nbnd), STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error allocating ppsi', 1)
+
+
+  CALL allocate_bec_type(nkb, nbnd, becp2)
+  CALL allocate_bec_type(nkb, nbnd, becp3)
+
+  DO ik = 1, nks
+
+    CALL davcio (evc, 2*nwordwfc, iunwfc, ik, - 1)
+
+    npw = ngk(ik)
+
+    CALL init_us_2(npw, igk_k(1, ik), xk(1, ik), vkb)
+
+    CALL calbec(npw, vkb, evc, becp2)
+
+    dipole_aux = czero
+
+    DO ipol = 1, 3
+      ! Compute dipole matrix element
+      CALL commutator_Hx_psi(ik, nbnd, a0(:, ipol), becp2, becp3, dpsi)
+      dpsi = ci * dpsi
+
+      ! Compute momentum matrix element (multiplication by i in the function here so not required here)
+      CALL multiply_momentum_psi(ik, nbnd, a0(:, ipol), ppsi)
+
+      DO ibnd=mbandst, mbandend
+        DO jbnd=nbandst, nbandend
+        ! Computing <psi|i[H, r]|psi>
+          dmec(:, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, dpsi(1, ibnd), 1)
+          ! Computing <psi|\hat{p}|psi>
+          IF (noncolin) THEN
+            dmec(ipol, jbnd, ibnd, ik) = dmec(ipol, jbnd, ibnd) + &
+            ZDOTC(npw, evc(1+npwx, lbnd), 1, dpsi(1+npwx, ibnd), 1)
+          ENDIF
+          ! 
+          pmec(:, jbnd, ibnd, ik) = ZDOTC(npw, evc(1, jbnd), 1, ppsi(1, ibnd), 1) 
+          IF (noncolin) THEN
+            pmec(ipol, jbnd, ibnd, ik) = pmec(ipol, jbnd, ibnd) + &
+            ZDOTC(npw, evc(1+npwx, lbnd), 1, ppsi(1+npwx, ibnd), 1)
+          ENDIF
+        ENDDO ! jbnd
+      ENDDO ! ibnd
+    ENDDO ! ipol
+  ENDDO ! ik
+
+
+
+  CALL deallocate_bec_type(becp2)
+  CALL deallocate_bec_type(becp3)
+
+  DEALLOCATE(dpsi, STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error deallocating dpsi', 1)
+  DEALLOCATE(ppsi, STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error deallocating ppsi', 1)
+
+
+  IF ( ionode ) THEN
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+    WRITE(stdout, '(/5x, a)') 'Finished calculation of dipole matrix elements'
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+
+
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+    WRITE(stdout, '(/5x, a)') 'Writing dipole matrix elements to files'
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+  ENDIF
+
+
+  !! Writing code adapted from BerkeleyGW/BSE/vmtxl.f90 write_vmtxl_bin subroutine
+  
+  DO ipol=1,3
+  
+    iunmout=58
+    fname = trim(momentum_output_file_name) // '_' // suffix(ipol)
+    OPEN(unit = iunmout, file = trim(momentum_output_file_name), status = 'replace', form = &
+        'formatted', iostat = ios)
+    iunvout=59
+    fname = trim(velocity_output_file_name) // '_' // suffix(ipol)
+    OPEN(unit = iunvout, file = trim(velocity_output_file_name), status = 'replace', form = &
+        'formatted', iostat = ios)
+    
+    ! 1 denotes momentum operator
+    WRITE(iunmout) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, 1
+    WRITE(iunmout) pmec(ipol, :, :, :)
+    ! <0 denotes velocity operator
+    WRITE(iunvout) nks, mbandend - mbandst + 1, nbandend - nbandst + 1, nspin, -1
+    WRITE(iunvout) dmec(ipol, :, :, :)
+
+    CLOSE(iunmout)
+    CLOSE(iunvout)
+
+  ENDDO ! ipol
+  IF ( ionode ) THEN
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+    WRITE(stdout, '(/5x, a)') 'Finished writing dipole matrix elements to files'
+    WRITE(stdout, '(/5x, a)') '-----------------------------------------------'
+  ENDIF
+
+  DEALLOCATE(dmec, STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error deallocating dmec', 1)
+  DEALLOCATE(pmec, STAT = ierr)
+  IF (ierr /= 0) CALL errore('write_vmtxl', 'Error deallocating pmec', 1)
+
+
+END SUBROUTINE write_vmtxl
+
+
+
+
+      
+
+
+
+
+
+
+
+
 
 END PROGRAM pw2bgw
 
